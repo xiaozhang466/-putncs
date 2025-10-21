@@ -1,0 +1,501 @@
+/**
+ * @file global_planning_node.cpp
+ * @brief 全局路径规划节点实现
+ * @description 基于PF-RRT*算法的全局路径规划ROS节点
+ *              负责接收点云地图和目标点，执行路径规划并发布结果
+ *              支持全局规划、滚动窗口规划和无目标探索三种模式
+ */
+
+#include "backward.hpp"          // 错误回溯库，用于程序崩溃时的调试信息
+#include "PUTN_planner.h"        // PF-RRT*路径规划器核心头文件
+#include <tf/transform_listener.h>     // TF变换监听器，获取机器人实时位置
+#include <visualization_msgs/Marker.h> // 可视化标记消息，用于RViz显示
+#include <nav_msgs/Path.h>            // 导航路径消息类型
+#include <std_msgs/Float32MultiArray.h> // 浮点数组消息，传输路径点坐标
+
+using namespace std;
+using namespace std_msgs;
+using namespace Eigen;
+using namespace PUTN;
+using namespace PUTN::visualization;
+using namespace PUTN::planner;
+
+/**
+ * @brief 错误回溯处理命名空间
+ * @description 提供程序崩溃时的详细堆栈信息，便于调试分析
+ */
+namespace backward
+{
+backward::SignalHandling sh;
+}
+
+/**
+ * @section ROS通信接口定义
+ * @description 定义与其他ROS节点通信的订阅者和发布者
+ */
+// ros related
+ros::Subscriber map_sub, wp_sub;    // 订阅者：地图数据和航点目标
+ros::Subscriber robot_pose_sub;     // 订阅者：机器人3D位置
+
+ros::Publisher grid_map_vis_pub;      // 发布者：栅格地图可视化
+ros::Publisher path_vis_pub;          // 发布者：规划路径可视化
+ros::Publisher goal_vis_pub;          // 发布者：目标点可视化
+ros::Publisher surf_vis_pub;          // 发布者：表面可视化
+ros::Publisher tree_vis_pub;          // 发布者：搜索树可视化
+ros::Publisher path_interpolation_pub; // 发布者：插值后的路径数据
+ros::Publisher tree_tra_pub;          // 发布者：树节点可遍历性信息
+
+/**
+ * @section 系统状态变量
+ */
+// indicate whether the robot has a moving goal
+bool has_goal = false;  // 标记机器人是否设置了移动目标
+bool has_robot_pose = false; // 标记是否接收到机器人位置
+
+/**
+ * @section 算法参数配置 
+ * @description 从ROS参数服务器加载的路径规划算法参数
+ */
+// simulation param from launch file
+double resolution;        // 栅格地图分辨率 (m/pixel)
+double goal_thre;         // 目标到达判断阈值 (m)
+double step_size;         // RRT*算法扩展步长 (m)
+double h_surf_car;        // 车辆表面高度参数 (m)
+double max_initial_time;  // 最大初始化时间限制 (ms)
+double radius_fit_plane;  // 平面拟合搜索半径 (m)
+FitPlaneArg fit_plane_arg; // 平面拟合算法参数结构体
+double neighbor_radius;   // RRT*邻居节点搜索半径 (m)
+
+/**
+ * @section 核心数据结构
+ * @description 路径规划系统的核心数据结构和对象
+ */
+// useful global variables
+Vector3d start_pt;        // 起始点坐标 (机器人当前位置)
+Vector3d target_pt;       // 目标点坐标 (用户指定目标)
+World* world = NULL;      // 世界环境对象指针 (包含地图和障碍物信息)
+PFRRTStar* pf_rrt_star = NULL; // PF-RRT*路径规划器对象指针
+
+/**
+ * @section 函数声明
+ * @description 主要功能函数的前向声明
+ */
+// function declaration
+void rcvWaypointsCallback(const nav_msgs::Path& wp);           // 接收航点目标回调函数
+void rcvPointCloudCallBack(const sensor_msgs::PointCloud2& pointcloud_map); // 接收点云地图回调函数
+void rcvRobotPoseCallback(const geometry_msgs::PoseStamped& pose); // 接收机器人3D位置回调函数
+void pubInterpolatedPath(const vector<Node*>& solution, ros::Publisher* _path_interpolation_pub); // 发布插值路径函数
+void findSolution();      // 路径规划求解主函数
+void callPlanner();       // 规划器调用控制函数
+
+/**
+ * @brief 接收机器人3D位置回调函数
+ * @param pose 机器人3D位置姿态消息
+ * @description 接收来自robot_pose_3d_setter的机器人位置更新
+ *              将位置转换为路径规划起点
+ */
+void rcvRobotPoseCallback(const geometry_msgs::PoseStamped& pose)
+{
+  start_pt = Vector3d(pose.pose.position.x, pose.pose.position.y, pose.pose.position.z);
+  has_robot_pose = true;
+  ROS_INFO("Robot 3D position updated: (%.2f, %.2f, %.2f)", start_pt(0), start_pt(1), start_pt(2));
+}
+
+/**
+ * @brief 接收来自RViz的航点目标回调函数
+ * @param wp 包含目标航点信息的路径消息
+ * @description 当用户在RViz中通过"2D Nav Goal"设置目标点时触发
+ *              提取路径消息中第一个航点作为规划目标
+ *              只有在地图已加载完成时才接受目标设置
+ */
+/**
+ *@brief receive goal from rviz
+ */
+void rcvWaypointsCallback(const nav_msgs::Path& wp)
+{
+  if (!world->has_map_)  // 检查地图是否已准备就绪
+    return;
+  has_goal = true;       // 设置目标标志位
+  // 从路径消息的第一个姿态中提取目标点三维坐标
+  target_pt = Vector3d(wp.poses[0].pose.position.x, wp.poses[0].pose.position.y, wp.poses[0].pose.position.z);
+  ROS_INFO("Receive the planning target");  // 输出目标接收确认信息
+}
+
+/**
+ * @brief 接收点云数据构建栅格地图的回调函数
+ * @param pointcloud_map 输入的点云地图数据 (sensor_msgs::PointCloud2格式)
+ * @description 将接收到的点云数据转换为内部地图表示
+ *              - 转换ROS点云消息为PCL格式以便处理
+ *              - 使用点云数据初始化三维栅格地图结构
+ *              - 将点云中每个点标记为障碍物
+ *              - 发布可视化信息供RViz显示
+ */
+/**
+ *@brief receive point cloud to build the grid map
+ */
+void rcvPointCloudCallBack(const sensor_msgs::PointCloud2& pointcloud_map)
+{
+  // 创建PCL点云容器并从ROS消息转换
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::fromROSMsg(pointcloud_map, cloud);
+
+  // 使用点云数据初始化世界环境的栅格地图
+  world->initGridMap(cloud);
+
+  // 遍历点云中的每个点，设置为障碍物
+  for (const auto& pt : cloud)
+  {
+    Vector3d obstacle(pt.x, pt.y, pt.z);  // 转换为Eigen三维向量
+    world->setObs(obstacle);               // 在栅格地图中标记障碍物
+  }
+  // 发布栅格地图可视化信息到RViz
+  visWorld(world, &grid_map_vis_pub);
+}
+
+/**
+ * @brief 发布插值后的路径供局部规划使用
+ * @param solution 原始路径节点序列
+ * @param path_interpolation_pub 路径插值数据发布者指针
+ * @description 对稀疏的规划路径进行线性插值，生成密集的路径点序列
+ *              - 设定插值间距约为0.1米，确保路径足够平滑
+ *              - 对路径中相邻节点间进行等间距插值
+ *              - 最终以Float32MultiArray格式发布连续的xyz坐标序列
+ *              - 为局部规划器提供高精度的参考轨迹
+ */
+/**
+ *@brief Linearly interpolate the generated path to meet the needs of local planning
+ */
+// pubInterpolatedPath() 会将生成的路径进行线性插值，以满足局部规划的需求。
+// 该函数会遍历路径中的每个节点，如果当前节点不是最后一个节点，则计算与下一个节点之间的插值点，并将其添加到消息中。
+// 最后，将插值后的路径发布到指定的主题上，以便后续使用或可视化展示。
+// 该函数的参数是一个节点指针向量和一个发布器指针，返回值为 void，表示不需要返回任何值。
+// 该函数的目的是将生成的路径进行插值处理，以便在局部规划中使用更平滑的路径。
+// 该函数的实现使用了 std_msgs::Float32MultiArray 消息类型，包含一个 data 数组，用于存储插值后的路径点坐标。
+// 该函数的实现依赖于 EuclideanDistance() 函数计算两点之间的距离，并使用 Vector3d 类型表示三维坐标。
+// 该函数的目的是在给定的路径节点列表中生成插值路径，以便后续使用或可视化展示。
+void pubInterpolatedPath(const vector<Node*>& solution, ros::Publisher* path_interpolation_pub)
+{
+  if (path_interpolation_pub == NULL)  // 安全检查：确保发布者有效
+    return;
+  
+  Float32MultiArray msg;  // 创建浮点数组消息用于存储路径点
+  
+  // 遍历路径中的每个节点进行插值处理
+  for (size_t i = 0; i < solution.size(); i++)
+  {
+    if (i == solution.size() - 1)  // 处理最后一个节点：直接添加
+    {
+      msg.data.push_back(solution[i]->position_(0));  // x坐标
+      msg.data.push_back(solution[i]->position_(1));  // y坐标  
+      msg.data.push_back(solution[i]->position_(2));  // z坐标
+    }
+    else  // 处理中间节点：在当前节点与下一节点间进行插值
+    {
+      // 计算需要插值的点数（每0.1米一个插值点）
+      size_t interpolation_num = (size_t)(EuclideanDistance(solution[i + 1], solution[i]) / 0.1);
+      // 计算两节点间的位移向量
+      Vector3d diff_pt = solution[i + 1]->position_ - solution[i]->position_;
+      
+      // 在两节点间等间距插值
+      for (size_t j = 0; j < interpolation_num; j++)
+      {
+        // 计算插值点位置：起点 + 比例*位移向量
+        Vector3d interpt = solution[i]->position_ + diff_pt * (float)j / interpolation_num;
+        msg.data.push_back(interpt(0));  // 插值点x坐标
+        msg.data.push_back(interpt(1));  // 插值点y坐标
+        msg.data.push_back(interpt(2));  // 插值点z坐标
+      }
+    }
+  }
+  path_interpolation_pub->publish(msg);  // 发布插值后的路径数据
+}
+
+/**
+ * @brief 路径规划求解主函数
+ * @description 在指定起点和终点的前提下，调用PF-RRT*算法进行路径规划
+ *              根据起点和终点的投影结果，算法分为三种工作情况：
+ *              情况1 (Invalid): 起点无法投影到地面，无法启动规划
+ *              情况2 (Global): 起点和终点都能投影，执行全局路径规划
+ *              情况3 (Roll): 起点能投影但终点不能，执行滚动窗口规划
+ *              规划完成后进行结果可视化，并检查是否达到目标区域
+ */
+/**
+ *@brief On the premise that the origin and target have been specified,call PF-RRT* algorithm for planning.
+ *       Accroding to the projecting results of the origin and the target,it can be divided into three cases.
+ */
+// findSolution() 会调用 PF-RRT* 算法进行路径规划，并根据规划状态生成最终路径。
+// 如果规划状态是 Invalid，则表示起点无法投影到地图上，无法开始规划；
+// 如果是 Global 状态，则执行全局规划，直到找到一条路径或达到最大迭代次数和时间限制；
+// 如果是 Roll 状态，则执行滚动规划，寻找子目标路径。
+// 最后，将生成的路径发布到指定的可视化主题上，并根据规划结果更新目标状态。
+// 如果找到的路径长度小于目标阈值，则认为机器人已经到达目标区域，更新目标状态并清除可视化信息。
+// 该函数的目的是在给定的起点和目标点之间找到一条可行路径，并进行可视化展示。
+// 该函数的实现依赖于 PFRRTStar 类的成员函数 initWithGoal()、planner()、pubTraversabilityOfTree() 等，以及 ROS 的发布和可视化功能。
+// 该函数的参数和返回值均为 void，表示不需要传入参数或返回值。
+void findSolution()
+{
+  printf("=========================================================================\n");
+  ROS_INFO("Start calling PF-RRT*");  // 开始调用PF-RRT*算法
+  Path solution = Path();              // 初始化路径解决方案
+
+  // 使用起点和目标点初始化规划器，确定规划状态
+  pf_rrt_star->initWithGoal(start_pt, target_pt);
+
+  // Case1: The PF-RRT* can't work at when the origin can't be project to surface
+  // 情况1：起点无法投影到表面时，PF-RRT*无法工作
+  if (pf_rrt_star->state() == Invalid)
+  {
+    ROS_WARN("The start point can't be projected.Unable to start PF-RRT* algorithm!!!");
+  }
+  // Case2: If both the origin and the target can be projected,the PF-RRT* will execute
+  //       global planning and try to generate a path
+  // 情况2：起点和终点都能投影时，执行全局规划并尝试生成路径
+  else if (pf_rrt_star->state() == Global)
+  {
+    ROS_INFO("Starting PF-RRT* algorithm at the state of global planning");
+    int max_iter = 5000;     // 最大迭代次数
+    double max_time = 100.0; // 初始最大规划时间(毫秒)
+
+    // 如果在限定时间内未找到解，逐步增加时间限制继续搜索
+    while (solution.type_ == Path::Empty && max_time < max_initial_time)
+    {
+      solution = pf_rrt_star->planner(max_iter, max_time);
+      max_time += 100.0;  // 每次增加100毫秒时间限制
+    }
+
+    if (!solution.nodes_.empty())
+      ROS_INFO("Get a global path!");  // 成功找到全局路径
+    else
+      ROS_WARN("No solution found!");  // 搜索失败，未找到路径
+  }
+  // Case3: If the origin can be projected while the target can not,the PF-RRT*
+  //       will try to find a temporary target for transitions.
+  // 情况3：起点能投影但终点不能时，寻找临时目标进行过渡
+  else
+  {
+    ROS_INFO("Starting PF-RRT* algorithm at the state of rolling planning");
+    int max_iter = 1500;     // 滚动规划的最大迭代次数  
+    double max_time = 100.0; // 滚动规划的时间限制
+
+    solution = pf_rrt_star->planner(max_iter, max_time);
+
+    if (!solution.nodes_.empty())
+      ROS_INFO("Get a sub path!");     // 成功找到子路径
+    else
+      ROS_WARN("No solution found!"); // 未找到子路径解决方案
+  }
+  ROS_INFO("End calling PF-RRT*");    // 结束PF-RRT*算法调用
+  printf("=========================================================================\n");
+
+  // 发布和可视化规划结果
+  pubInterpolatedPath(solution.nodes_, &path_interpolation_pub);  // 发布插值后的路径数据
+  visPath(solution.nodes_, &path_vis_pub);                       // 可视化路径在RViz中
+  visSurf(solution.nodes_, &surf_vis_pub);                       // 可视化路径对应的表面信息
+
+  // When the PF-RRT* generates a short enough global path,it's considered that the robot has
+  // reached the goal region.
+  // 当PF-RRT*生成的全局路径足够短时，认为机器人已到达目标区域
+  if (solution.type_ == Path::Global && EuclideanDistance(pf_rrt_star->origin(), pf_rrt_star->target()) < goal_thre)
+  {
+    has_goal = false;                         // 清除目标标志，准备接收新目标
+    visOriginAndGoal({}, &goal_vis_pub);     // 清除目标点可视化显示
+    visPath({}, &path_vis_pub);              // 清除路径可视化显示
+    ROS_INFO("The Robot has achieved the goal!!!");  // 输出到达目标的确认信息
+  }
+
+  // 如果规划失败（无解），清除路径可视化
+  if (solution.type_ == Path::Empty)
+    visPath({}, &path_vis_pub);
+}
+
+/**
+ * @brief 路径规划器调用控制函数
+ * @description 智能控制PF-RRT*算法的调用时机和模式
+ *              实现三种工作模式的自动切换：
+ *              - 无目标探索模式：持续扩展搜索树以探索环境空间
+ *              - 有目标规划模式：执行目标导向的路径规划
+ *              - 探索完成模式：当搜索树足够大时停止无目标探索
+ *              通过时间控制确保系统的实时响应性能
+ */
+/**
+ *@brief On the premise that the origin and target have been specified,call PF-RRT* algorithm for planning.
+ *       Accroding to the projecting results of the origin and the target,it can be divided into three cases.
+ */
+// callPlanner() 会根据当前的规划状态和目标状态调用 PF-RRT* 算法进行路径规划。
+// 如果当前状态是 WithoutGoal，则执行初始化操作，设置起点，并开始全局规划；
+// 如果有目标且当前状态是 Global，则调用 findSolution() 函数进行路径规划；
+// 如果没有目标且初始化时间小于最大初始时间，则继续扩展树，直到达到最大迭代次数或最大时间限制；
+// 最后，如果树的大小足够大，则停止扩展，并输出当前树的大小信息。
+// 该函数的目的是在给定的起点和目标点之间找到一条可行路径，并进行可视化展示。
+// 该函数的实现依赖于 PFRRTStar 类的成员函数 initWithoutGoal()、planner() 等，以及 ROS 的发布和可视化功能。
+// 该函数的参数和返回值均为 void，表示不需要传入参数或返回值。
+// 该函数的目的是在给定的起点和目标点之间找到一条可行路径，并进行可视化展示。
+void callPlanner()
+{
+  static double init_time_cost = 0.0;  // 静态变量记录总初始化耗时
+  if (!world->has_map_)                // 安全检查：确保地图已加载
+    return;
+
+  if (!has_robot_pose)  // 安全检查：确保有机器人位置
+  {
+    ROS_WARN_THROTTLE(5, "Waiting for robot pose from robot_pose_3d_setter...");
+    return;
+  }
+
+  // The tree will expand at a certain frequency to explore the space more fully
+  // 模式1：无目标探索模式 - 在没有目标且初始化时间未超限时，持续扩展搜索树
+  if (!has_goal && init_time_cost < 1000)
+  {
+    // 记录本次初始化的开始时间
+    timeval start;
+    gettimeofday(&start, NULL);
+    
+    // 使用当前机器人位置初始化规划器（无目标模式）
+    pf_rrt_star->initWithoutGoal(start_pt);
+    
+    // 计算并累加初始化耗时
+    timeval end;
+    gettimeofday(&end, NULL);
+    init_time_cost = 1000 * (end.tv_sec - start.tv_sec) + 0.001 * (end.tv_usec - start.tv_usec);
+    
+    if (pf_rrt_star->state() == WithoutGoal)  // 如果成功进入无目标探索状态
+    {
+      int max_iter = 550;       // 每次探索的最大迭代次数
+      double max_time = 100.0;  // 每次探索的时间限制(毫秒)
+      pf_rrt_star->planner(max_iter, max_time);  // 执行搜索树扩展
+      ROS_INFO("Current size of tree: %d", (int)(pf_rrt_star->tree().size())); // 输出当前树规模
+    }
+    else
+      ROS_WARN("The start point can't be projected,unable to execute PF-RRT* algorithm"); // 起点投影失败警告
+  }
+  // If there is a specified moving target,call PF-RRT* to find a solution
+  // 模式2：有目标规划模式 - 当用户指定目标时，执行路径规划求解
+  else if (has_goal)
+  {
+    findSolution();        // 调用路径规划求解函数
+    init_time_cost = 0.0;  // 重置初始化时间计数，为下次无目标探索做准备
+  }
+  // The expansion of tree will stop after the process of initialization takes more than 1s
+  // 模式3：探索完成模式 - 初始化时间超过1秒后停止树扩展
+  else
+    ROS_INFO("The tree is large enough.Stop expansion!Current size: %d", (int)(pf_rrt_star->tree().size()));
+}
+
+/**
+ * @brief 全局路径规划节点主函数
+ * @param argc 命令行参数个数
+ * @param argv 命令行参数数组
+ * @return 程序退出状态码
+ * @description 全局路径规划系统的主入口点，负责完整的系统初始化和运行
+ *              主要职责包括：
+ *              1. ROS节点和通信接口初始化
+ *              2. 算法参数加载和配置
+ *              3. 核心对象实例化和设置
+ *              4. 实时主循环：位置更新、规划执行、频率控制
+ *              系统以100ms固定频率运行，确保实时性能
+ */
+int main(int argc, char** argv)
+{
+  // ROS系统初始化
+  ros::init(argc, argv, "global_planning_node");  // 初始化ROS节点
+  ros::NodeHandle nh("~");  // 创建私有命名空间的节点句柄
+
+  /**
+   * @subsection ROS通信接口设置
+   * @description 建立与其他节点的数据通信通道
+   */
+  // 订阅者设置 - 接收外部数据
+  map_sub = nh.subscribe("map", 1, rcvPointCloudCallBack);      // 订阅点云地图数据
+  wp_sub = nh.subscribe("waypoints", 1, rcvWaypointsCallback);  // 订阅用户设置的航点目标
+  robot_pose_sub = nh.subscribe("robot_pose_3d", 1, rcvRobotPoseCallback); // 订阅机器人3D位置
+
+  // 发布者设置 - 向外发布数据和可视化信息
+  grid_map_vis_pub = nh.advertise<sensor_msgs::PointCloud2>("grid_map_vis", 1);     // 栅格地图可视化
+  path_vis_pub = nh.advertise<visualization_msgs::Marker>("path_vis", 20);          // 规划路径可视化
+  goal_vis_pub = nh.advertise<visualization_msgs::Marker>("goal_vis", 1);           // 目标点可视化
+  surf_vis_pub = nh.advertise<sensor_msgs::PointCloud2>("surf_vis", 100);          // 路径表面可视化
+  tree_vis_pub = nh.advertise<visualization_msgs::Marker>("tree_vis", 1);          // 搜索树可视化
+  tree_tra_pub = nh.advertise<std_msgs::Float32MultiArray>("tree_tra", 1);         // 树可遍历性数据
+  path_interpolation_pub = nh.advertise<std_msgs::Float32MultiArray>("global_path", 1000); // 插值路径数据
+
+  /**
+   * @subsection 算法参数加载
+   * @description 从ROS参数服务器加载路径规划算法的配置参数
+   */
+  // 地图相关参数
+  nh.param("map/resolution", resolution, 0.1);  // 栅格地图分辨率，默认0.1m
+
+  // 核心规划参数
+  nh.param("planning/goal_thre", goal_thre, 1.0);              // 目标到达判断阈值，默认1.0m
+  nh.param("planning/step_size", step_size, 0.2);              // RRT*扩展步长，默认0.2m
+  nh.param("planning/h_surf_car", h_surf_car, 0.4);            // 车辆表面高度，默认0.4m
+  nh.param("planning/neighbor_radius", neighbor_radius, 1.0);   // 邻居搜索半径，默认1.0m
+
+  // 平面拟合算法参数 - 用于地形评估
+  nh.param("planning/w_fit_plane", fit_plane_arg.w_total_, 0.4);      // 拟合权重总和，默认0.4
+  nh.param("planning/w_flatness", fit_plane_arg.w_flatness_, 4000.0); // 平坦度权重，默认4000.0
+  nh.param("planning/w_slope", fit_plane_arg.w_slope_, 0.4);          // 坡度权重，默认0.4
+  nh.param("planning/w_sparsity", fit_plane_arg.w_sparsity_, 0.4);    // 稀疏度权重，默认0.4
+  nh.param("planning/ratio_min", fit_plane_arg.ratio_min_, 0.25);     // 最小比率阈值，默认0.25
+  nh.param("planning/ratio_max", fit_plane_arg.ratio_max_, 0.4);      // 最大比率阈值，默认0.4
+  nh.param("planning/conv_thre", fit_plane_arg.conv_thre_, 0.1152);   // 收敛阈值，默认0.1152
+
+  nh.param("planning/radius_fit_plane", radius_fit_plane, 1.0);       // 平面拟合半径，默认1.0m
+
+  nh.param("planning/max_initial_time", max_initial_time, 1000.0);    // 最大初始化时间，默认1000ms
+
+  /**
+   * @subsection 核心系统初始化
+   * @description 创建和配置路径规划系统的核心组件
+   */
+  // Initialization
+  world = new World(resolution);              // 创建世界环境实例，管理地图和障碍物
+  pf_rrt_star = new PFRRTStar(h_surf_car, world); // 创建PF-RRT*规划器实例
+
+  // Set argument of PF-RRT*
+  // 配置PF-RRT*规划器的所有算法参数
+  pf_rrt_star->setGoalThre(goal_thre);           // 设置目标到达阈值
+  pf_rrt_star->setStepSize(step_size);           // 设置树扩展步长
+  pf_rrt_star->setFitPlaneArg(fit_plane_arg);    // 设置平面拟合参数结构
+  pf_rrt_star->setFitPlaneRadius(radius_fit_plane); // 设置平面拟合搜索半径
+  pf_rrt_star->setNeighborRadius(neighbor_radius);  // 设置邻居节点搜索半径
+
+  // 将发布者指针传递给规划器，用于实时可视化
+  pf_rrt_star->goal_vis_pub_ = &goal_vis_pub;
+  pf_rrt_star->tree_vis_pub_ = &tree_vis_pub;
+  pf_rrt_star->tree_tra_pub_ = &tree_tra_pub;
+
+  /**
+   * @subsection 实时主循环
+   * @description 系统的核心运行循环，以100ms固定频率执行
+   *              每个循环周期完成以下关键任务：
+   *              1. 处理ROS回调函数（地图更新、目标设置、机器人位置更新）
+   *              2. 调用路径规划器执行规划任务
+   *              3. 控制循环频率保证实时性能
+   */
+  while (ros::ok())
+  {
+    // 记录循环周期开始时间，用于频率控制
+    timeval start;
+    gettimeofday(&start, NULL);
+
+    // Execute the callback functions to update the grid map, robot pose, and check if there's a new goal
+    // 任务1：执行回调函数处理，更新地图数据、机器人位置并检查新目标
+    ros::spinOnce();
+    
+    // Call the PF-RRT* to work
+    // 任务2：调用路径规划器执行规划工作
+    callPlanner();
+    
+    // 任务3：循环频率控制 - 确保每个周期至少持续100毫秒
+    double ms;
+    do
+    {
+      timeval end;
+      gettimeofday(&end, NULL);
+      // 计算已消耗的时间（毫秒）
+      ms = 1000 * (end.tv_sec - start.tv_sec) + 0.001 * (end.tv_usec - start.tv_usec);
+    } while (ms < 100);  // Cycle in 100ms - 维持100ms的固定循环周期
+  }
+  return 0;  // 程序正常退出
+}
