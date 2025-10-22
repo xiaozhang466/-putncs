@@ -1,6 +1,70 @@
 <launch>
-  <include file="$(find aloam_velodyne)/launch/aloam_velodyne_HDL_32.launch">
+  <!-- LSLiDAR C16 parameters -->
+  <arg name="lidar_ip" default="192.168.1.200"/>
+  <arg name="lidar_frame" default="velodyne"/>
+  <arg name="lidar_fixed_frame" default="world"/>
+  <arg name="lidar_topic" default="/velodyne_points"/>
+  <arg name="lidar_min_range" default="0.3"/>
+  <arg name="lidar_max_range" default="100.0"/>
+  <arg name="lidar_frequency" default="10.0"/>
+  <arg name="lidar_x" default="0.15"/> <!-- lidar ahead of base center by 15cm -->
+  <arg name="lidar_y" default="0.0"/>
+  <arg name="lidar_z" default="0.7"/>  <!-- base_link≈0.3m, lidar≈1.0m -->
+  <arg name="lidar_roll" default="0.0"/>
+  <arg name="lidar_pitch" default="0.0"/>
+  <arg name="lidar_yaw" default="0.0"/>
+
+  <!-- Ranger Mini chassis parameters -->
+  <arg name="can_port" default="can0"/>
+  <arg name="odom_frame" default="odom"/>
+  <arg name="odom_topic" default="odom"/>
+  <arg name="publish_odom_tf" default="false"/>
+  <arg name="chassis_update_rate" default="50"/>
+
+  <!-- LSLiDAR C16 driver + decoder -->
+  <node pkg="nodelet" type="nodelet"
+        name="lslidar_c16_nodelet_manager"
+        args="manager" output="screen"/>
+
+  <node pkg="nodelet" type="nodelet"
+        name="lslidar_c16_driver_nodelet"
+        args="load lslidar_c16_driver/LslidarC16DriverNodelet lslidar_c16_nodelet_manager"
+        output="screen">
+    <param name="frame_id" value="$(arg lidar_frame)"/>
+    <param name="device_ip" value="$(arg lidar_ip)"/>
+  </node>
+
+  <node pkg="nodelet" type="nodelet"
+        name="lslidar_c16_decoder_nodelet"
+        args="load lslidar_c16_decoder/LslidarC16DecoderNodelet lslidar_c16_nodelet_manager"
+        output="screen">
+    <param name="fixed_frame_id" value="$(arg lidar_fixed_frame)"/>
+    <param name="child_frame_id" value="$(arg lidar_frame)"/>
+    <param name="min_range" value="$(arg lidar_min_range)"/>
+    <param name="max_range" value="$(arg lidar_max_range)"/>
+    <param name="frequency" value="$(arg lidar_frequency)"/>
+    <param name="publish_point_cloud" value="true"/>
+    <remap from="lslidar_point_cloud" to="$(arg lidar_topic)"/>
+  </node>
+
+  <!-- Static transform between base_link and lidar. Update translation/rotation as measured on the vehicle. -->
+  <node pkg="tf" type="static_transform_publisher" name="base_to_lidar"
+        args="$(arg lidar_x) $(arg lidar_y) $(arg lidar_z) $(arg lidar_yaw) $(arg lidar_pitch) $(arg lidar_roll) /base_link $(arg lidar_frame) 10"/>
+
+  <!-- Use VLP-16 configuration for A-LOAM -->
+  <include file="$(find aloam_velodyne)/launch/aloam_velodyne_VLP_16.launch">
 	  <arg name="rviz" value="false"/>
+  </include>
+
+  <!-- Ranger Mini V2 chassis driver -->
+  <include file="$(find ranger_bringup)/launch/ranger_mini_v2.launch">
+    <arg name="port_name" value="$(arg can_port)"/>
+    <arg name="robot_model" value="ranger_mini_v2"/>
+    <arg name="odom_frame" value="$(arg odom_frame)"/>
+    <arg name="base_frame" value="base_link"/>
+    <arg name="update_rate" value="$(arg chassis_update_rate)"/>
+    <arg name="odom_topic_name" value="$(arg odom_topic)"/>
+    <arg name="publish_odom_tf" value="$(arg publish_odom_tf)"/>
   </include>
 
   <node pkg="tf" type="static_transform_publisher" name="world_to_camera_init" args="0 0 0 0 0 0 /world /camera_init 10" /><!--10ms-->
@@ -26,8 +90,8 @@
       <param name="map/local_x_u"       value="1.8"/>
       <param name="map/local_y_l"       value="-1.8"/>
       <param name="map/local_y_u"       value="1.8"/>
-      <param name="map/local_z_l"       value="-0.5"/>
-      <param name="map/local_z_u"       value="0.4"/>
+      <param name="map/local_z_l"       value="-1.2"/>
+      <param name="map/local_z_u"       value="0.1"/>
   </node>
 
   <node pkg="gpr" type="gpr_path" name="gpr_path" output="screen" required="true">

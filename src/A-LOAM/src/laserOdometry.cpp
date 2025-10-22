@@ -34,7 +34,9 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -324,14 +326,64 @@ int main(int argc, char **argv)
             timeSurfPointsLessFlat = surfLessFlatBuf.front()->header.stamp.toSec();
             timeLaserCloudFullRes = fullPointsBuf.front()->header.stamp.toSec();
 
-            // 检查时间戳是否一致，确保数据同步
-            if (timeCornerPointsSharp != timeLaserCloudFullRes ||
-                timeCornerPointsLessSharp != timeLaserCloudFullRes ||
-                timeSurfPointsFlat != timeLaserCloudFullRes ||
-                timeSurfPointsLessFlat != timeLaserCloudFullRes)
+            // 检查时间戳是否一致，确保数据同步（允许一定容差并丢弃旧数据）
+            const double timeTolerance = 1e-3; // 1ms容差
+            const double timeMin = std::min(
+                {timeCornerPointsSharp, timeCornerPointsLessSharp,
+                 timeSurfPointsFlat, timeSurfPointsLessFlat, timeLaserCloudFullRes});
+            const double timeMax = std::max(
+                {timeCornerPointsSharp, timeCornerPointsLessSharp,
+                 timeSurfPointsFlat, timeSurfPointsLessFlat, timeLaserCloudFullRes});
+
+            if (timeMax - timeMin > timeTolerance)
             {
-                printf("unsync messeage!");  // 数据不同步，退出程序
-                ROS_BREAK();
+                ROS_WARN_STREAM_THROTTLE(1.0,
+                    "laserOdometry: unsync message ("
+                    << std::fixed << std::setprecision(6)
+                    << "corner_sharp=" << timeCornerPointsSharp
+                    << ", corner_less=" << timeCornerPointsLessSharp
+                    << ", surf_flat=" << timeSurfPointsFlat
+                    << ", surf_less=" << timeSurfPointsLessFlat
+                    << ", full=" << timeLaserCloudFullRes << "). Drop oldest data.");
+
+                auto nearlyEqual = [](double a, double b) {
+                    return std::fabs(a - b) < 1e-6;
+                };
+
+                bool dropped = false;
+                mBuf.lock();
+                if (!cornerSharpBuf.empty() && nearlyEqual(cornerSharpBuf.front()->header.stamp.toSec(), timeMin))
+                {
+                    cornerSharpBuf.pop();
+                    dropped = true;
+                }
+                if (!dropped && !cornerLessSharpBuf.empty() && nearlyEqual(cornerLessSharpBuf.front()->header.stamp.toSec(), timeMin))
+                {
+                    cornerLessSharpBuf.pop();
+                    dropped = true;
+                }
+                if (!dropped && !surfFlatBuf.empty() && nearlyEqual(surfFlatBuf.front()->header.stamp.toSec(), timeMin))
+                {
+                    surfFlatBuf.pop();
+                    dropped = true;
+                }
+                if (!dropped && !surfLessFlatBuf.empty() && nearlyEqual(surfLessFlatBuf.front()->header.stamp.toSec(), timeMin))
+                {
+                    surfLessFlatBuf.pop();
+                    dropped = true;
+                }
+                if (!dropped && !fullPointsBuf.empty() && nearlyEqual(fullPointsBuf.front()->header.stamp.toSec(), timeMin))
+                {
+                    fullPointsBuf.pop();
+                    dropped = true;
+                }
+                if (!dropped && !fullPointsBuf.empty())
+                {
+                    // 若无法定位最旧的队列，则保守地弹出完整点云队列的首元素
+                    fullPointsBuf.pop();
+                }
+                mBuf.unlock();
+                continue;
             }
 
             // === 数据提取与转换 ===
