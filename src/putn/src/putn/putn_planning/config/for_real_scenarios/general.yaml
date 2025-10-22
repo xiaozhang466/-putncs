@@ -8,15 +8,15 @@ map:
 planning: 
   start_x: 4.0
   start_y: 0.0
-  start_z: 0.5
+  start_z: -0.7     # Project to ground level (laser_link - 0.7m = base_link)
   target_x: 10.0
   target_y: 5.0
-  target_z: -1.0
+  target_z: -0.7    # Target also at ground level
 
   step_size: 0.3
-  h_surf_car: 0.7
+  h_surf_car: 0.3   # Car base height above ground (~0.3m)
 
-  radius_fit_plane: 0.6
+  radius_fit_plane: 1.0  # Larger radius for better ground fitting
 
   w_flatness: 2000.0
   w_slope: 0.03

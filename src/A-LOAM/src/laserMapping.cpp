@@ -62,8 +62,6 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-#include <algorithm>
-#include <iomanip>
 #include <math.h>
 #include <vector>
 #include <aloam_velodyne/common.h>
@@ -334,58 +332,15 @@ void process()
 			timeLaserCloudFullRes = fullResBuf.front()->header.stamp.toSec();        // 完整点云时间戳
 			timeLaserOdometry = odometryBuf.front()->header.stamp.toSec();           // 里程计时间戳
 
-			// 检查时间戳是否同步（允许一定容差并丢弃旧数据）
-			const double timeTolerance = 1e-3; // 1ms容差
-			const double timeMin = std::min(
-				{timeLaserCloudCornerLast, timeLaserCloudSurfLast,
-				 timeLaserCloudFullRes, timeLaserOdometry});
-			const double timeMax = std::max(
-				{timeLaserCloudCornerLast, timeLaserCloudSurfLast,
-				 timeLaserCloudFullRes, timeLaserOdometry});
-
-			if (timeMax - timeMin > timeTolerance)
+			// 检查时间戳是否同步（必须严格相等）
+			if (timeLaserCloudCornerLast != timeLaserOdometry ||
+				timeLaserCloudSurfLast != timeLaserOdometry ||
+				timeLaserCloudFullRes != timeLaserOdometry)
 			{
-				ROS_WARN_STREAM_THROTTLE(1.0,
-					"laserMapping: unsync message ("
-					<< std::fixed << std::setprecision(6)
-					<< "corner=" << timeLaserCloudCornerLast
-					<< ", surf=" << timeLaserCloudSurfLast
-					<< ", full=" << timeLaserCloudFullRes
-					<< ", odom=" << timeLaserOdometry
-					<< "). Drop oldest data.");
-
-				auto nearlyEqual = [](double a, double b) {
-					return std::fabs(a - b) < 1e-6;
-				};
-
-				bool dropped = false;
-				if (!cornerLastBuf.empty() && nearlyEqual(cornerLastBuf.front()->header.stamp.toSec(), timeMin))
-				{
-					cornerLastBuf.pop();
-					dropped = true;
-				}
-				if (!dropped && !surfLastBuf.empty() && nearlyEqual(surfLastBuf.front()->header.stamp.toSec(), timeMin))
-				{
-					surfLastBuf.pop();
-					dropped = true;
-				}
-				if (!dropped && !fullResBuf.empty() && nearlyEqual(fullResBuf.front()->header.stamp.toSec(), timeMin))
-				{
-					fullResBuf.pop();
-					dropped = true;
-				}
-				if (!dropped && !odometryBuf.empty() && nearlyEqual(odometryBuf.front()->header.stamp.toSec(), timeMin))
-				{
-					odometryBuf.pop();
-					dropped = true;
-				}
-				if (!dropped && !fullResBuf.empty())
-				{
-					fullResBuf.pop();
-				}
-
+				printf("time corner %f surf %f full %f odom %f \n", timeLaserCloudCornerLast, timeLaserCloudSurfLast, timeLaserCloudFullRes, timeLaserOdometry);
+				printf("unsync messeage!");                       // 时间戳不同步警告
 				mBuf.unlock();
-				continue;
+				break;
 			}
 
 			// === 提取点云数据 ===

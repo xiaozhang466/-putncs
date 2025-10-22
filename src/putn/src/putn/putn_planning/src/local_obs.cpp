@@ -87,7 +87,9 @@ void rcvVelodyneCallBack(const sensor_msgs::PointCloud2& velodyne_points)
     listener_ptr->transformPoint("/world", origin_point, trans_point);
 
     pcl::PointXYZ _pt;
-    if (!(-1.2 < pt.x && pt.x < 0.4 && -0.4 < pt.y && pt.y < 0.4))
+    // Filter out robot body: expand to cover entire vehicle platform
+    // Robot dimensions: length ~1.0m, width ~0.6m, centered at aft_mapped origin
+    if (!(-1.5 < pt.x && pt.x < 0.5 && -0.5 < pt.y && pt.y < 0.5))
     {
       obs_array.data.push_back(trans_point.point.x);
       obs_array.data.push_back(trans_point.point.y);

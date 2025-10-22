@@ -1,0 +1,13 @@
+digraph G {
+"base_link" -> "velodyne"[label="Broadcaster: /base_to_lidar\nAverage rate: 99.351 Hz\nMost recent transform: 1761102307.154 ( -0.002 sec old)\nBuffer length: 4.992 sec\n"];
+"aft_mapped" -> "base_link"[label="Broadcaster: /camera_to_link\nAverage rate: 99.338 Hz\nMost recent transform: 1761102307.154 ( -0.002 sec old)\nBuffer length: 4.983 sec\n"];
+"world" -> "camera_init"[label="Broadcaster: /world_to_camera_init\nAverage rate: 99.352 Hz\nMost recent transform: 1761102307.153 ( -0.001 sec old)\nBuffer length: 4.982 sec\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1761102307.152"[ shape=plaintext ] ;
+ }->"world";
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1761102307.152"[ shape=plaintext ] ;
+ }->"aft_mapped";
+}
